@@ -1,5 +1,7 @@
 # GitHubApi567-hw4a
 
+[![CircleCI](https://dl.circleci.com/status-badge/img/gh/Enochhchan/GitHubApi567-hw4a/tree/HW03a_Mocking.svg?style=svg)](https://dl.circleci.com/status-badge/redirect/gh/Enochhchan/GitHubApi567-hw4a/tree/HW03a_Mocking)
+
 A tiny, tester-minded Python 3 app that prints each repo for a GitHub user with its commit count.
 
 ## Usage
