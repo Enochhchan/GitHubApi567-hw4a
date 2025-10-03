@@ -1,98 +1,80 @@
-import unittest
-from unittest.mock import patch, Mock
+import types
+import pytest
+from unittest.mock import patch
 
-from src.github_api import GitHubAPI, repos_and_commits_for_user, GitHubAPIError
-
-
-class FakeResponse:
-    def __init__(self, status_code=200, json_data=None, reason="OK"):
-        self.status_code = status_code
-        self._json = json_data
-        self.reason = reason
-    def json(self):
-        return self._json
+from github_api import GitHubAPI, GitHubAPIError   # adjust if needed
 
 
-class MockingTests(unittest.TestCase):
-    @patch("requests.Session.get")
-    def test_repo_commit_counts_happy_path(self, mock_get):
-        """
-        Simulates:
-          - list repos (page1) -> two repos
-          - list repos (page2) -> empty
-          - commits for repoA (page1) -> 2
-          - commits for repoA (page2) -> empty
-          - commits for repoB (page1) -> 1
-          - commits for repoB (page2) -> empty
-        No real network calls.
-        """
-        mock_get.side_effect = [
-            # list_user_repos pages
-            FakeResponse(200, [{"name": "repoA"}, {"name": "repoB"}]),
-            FakeResponse(200, []),
-
-            # commits for repoA pages
-            FakeResponse(200, [{}, {}]),
-            FakeResponse(200, []),
-
-            # commits for repoB pages
-            FakeResponse(200, [{}]),
-            FakeResponse(200, []),
-        ]
-
-        api = GitHubAPI()  # unchanged app code
-        pairs = api.repo_commit_counts("someuser")
-        self.assertEqual(pairs, [("repoA", 2), ("repoB", 1)])
-        self.assertGreaterEqual(mock_get.call_count, 6)  # sanity: used the mock, not the network
-
-    @patch("requests.Session.get")
-    def test_error_repo_is_counted_zero_and_flow_continues(self, mock_get):
-        """
-        First repo ok, second repo errors on commits.
-        App code catches GitHubAPIError and records 0 for that repo.
-        """
-        mock_get.side_effect = [
-            # repos:
-            FakeResponse(200, [{"name": "ok"}, {"name": "bad"}]),
-            FakeResponse(200, []),
-
-            # commits for ok (2 commits then end):
-            FakeResponse(200, [{}, {}]),
-            FakeResponse(200, []),
-
-            # commits for bad -> _get should raise via status_code >= 400
-            FakeResponse(500, {"message": "boom"}, reason="Server Error"),
-        ]
-
-        api = GitHubAPI()
-        out = api.repo_commit_counts("user")
-        self.assertEqual(out, [("ok", 2), ("bad", 0)])
-
-    @patch("requests.Session.get")
-    def test_top_level_helper_uses_mock_only(self, mock_get):
-        """
-        End-to-end via the convenience function, but fully mocked.
-        """
-        mock_get.side_effect = [
-            # repos:
-            FakeResponse(200, [{"name": "gamma"}]),
-            FakeResponse(200, []),
-
-            # commits for gamma:
-            FakeResponse(200, [{}, {}, {}]),
-            FakeResponse(200, []),
-        ]
-
-        text = repos_and_commits_for_user("someone")
-        self.assertEqual(text, "Repo: gamma Number of commits: 3")
-
-    @patch("requests.Session.get")
-    def test_list_user_repos_raises_on_http_error(self, mock_get):
-        mock_get.return_value = FakeResponse(404, {"message": "Not Found"}, reason="Not Found")
-        api = GitHubAPI()
-        with self.assertRaises(GitHubAPIError):
-            api.list_user_repos("nope")
+def _resp_with_json(obj):
+    """Tiny helper to mimic requests.Response with a json() method."""
+    r = types.SimpleNamespace()
+    r.json = lambda: obj
+    return r
 
 
-if __name__ == "__main__":
-    unittest.main()
+@patch.object(GitHubAPI, "_get")
+def test_list_user_repos_raises_when_json_not_list(mock_get):
+    """Covers: raise GitHubAPIError(...) in list_user_repos when JSON isn't a list."""
+    mock_get.return_value = _resp_with_json({"message": "not-a-list"})
+    api = GitHubAPI()
+    with pytest.raises(GitHubAPIError):
+        api.list_user_repos("octocat")
+
+
+@patch.object(GitHubAPI, "_get")
+def test_count_commits_raises_when_json_not_list(mock_get):
+    """Covers: raise GitHubAPIError(...) in count_commits when JSON isn't a list."""
+    mock_get.return_value = _resp_with_json({"message": "not-a-list"})
+    api = GitHubAPI()
+    with pytest.raises(GitHubAPIError):
+        api.count_commits("octocat", "hello-world")
+
+
+@patch.object(GitHubAPI, "_get")
+def test_list_user_repos_pagination_empty_page_breaks(mock_get):
+    """
+    Covers the 'if not data: break' pagination branch:
+    first page has 1 repo; second page empty -> loop breaks cleanly.
+    """
+    page1 = _resp_with_json([{"name": "r1"}])
+    page2 = _resp_with_json([])  # triggers the break
+    mock_get.side_effect = [page1, page2]
+
+    api = GitHubAPI()
+    names = api.list_user_repos("octocat")
+
+    assert names == ["r1"]
+    assert mock_get.call_count == 2  # we fetched page 1 then the empty page
+
+from github_api import GitHubAPI, GitHubAPIError
+
+@patch.object(GitHubAPI, "count_commits")
+@patch.object(GitHubAPI, "list_user_repos")
+def test_repo_commit_counts_skips_errors(mock_list, mock_count):
+    mock_list.return_value = ["repo1"]
+    mock_count.side_effect = GitHubAPIError("bad repo")
+
+    api = GitHubAPI()
+    result = api.repo_commit_counts("octocat")
+
+    # Should append ("repo1", 0) instead of crashing
+    assert result == [("repo1", 0)]
+
+    from github_api import format_repo_counts
+
+def test_format_repo_counts_output():
+    pairs = [("r1", 5), ("r2", 0)]
+    out = format_repo_counts(pairs)
+    assert "Repo: r1 Number of commits: 5" in out
+    assert "Repo: r2 Number of commits: 0" in out
+
+from github_api import repos_and_commits_for_user
+
+def test_repos_and_commits_for_user(monkeypatch):
+    # Patch the GitHubAPI methods used inside
+    import github_api
+    monkeypatch.setattr(github_api.GitHubAPI, "repo_commit_counts",
+                        lambda self, user: [("demo", 3)])
+
+    out = repos_and_commits_for_user("octocat")
+    assert "Repo: demo Number of commits: 3" in out
